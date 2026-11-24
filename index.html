@@ -54,6 +54,20 @@
     color: var(--c);
   }
 
+  /* A soft blob with no edge anywhere: full colour only at the very centre,
+     fading to unlit (see-through) by the edge of the display. */
+  #app[data-style="glow"] #surface {
+    background: radial-gradient(circle closest-side,
+      var(--c) 0%,
+      color-mix(in srgb, var(--c) 90%, #000) 15%,
+      color-mix(in srgb, var(--c) 68%, #000) 30%,
+      color-mix(in srgb, var(--c) 44%, #000) 45%,
+      color-mix(in srgb, var(--c) 24%, #000) 60%,
+      color-mix(in srgb, var(--c) 10%, #000) 75%,
+      color-mix(in srgb, var(--c) 3%, #000) 88%,
+      #000 100%);
+  }
+
   #app[data-label="off"] #label { visibility: hidden; }
 
   .panel {
@@ -106,6 +120,7 @@
     <button type="button" id="label-btn"></button>
     <button type="button" id="north-btn">Set north to here</button>
     <button type="button" id="reset-btn">Reset north</button>
+    <button type="button" id="flip-btn">Reverse direction</button>
     <button type="button" id="close-btn">Close</button>
   </section>
 
@@ -181,7 +196,12 @@
     },
   };
 
-  let style = store.get('cc.style', 'fill') === 'ring' ? 'ring' : 'fill';
+  const STYLES = ['fill', 'ring', 'glow'];
+  let style = STYLES.includes(store.get('cc.style', 'fill')) ? store.get('cc.style', 'fill') : 'fill';
+  // Which way alpha counts. The W3C spec says counter-clockwise, but on the
+  // glasses the heading ran backwards with that, so clockwise is the default.
+  // "Reverse direction" in the menu switches it.
+  let alphaClockwise = store.get('cc.alpha', 'cw') !== 'ccw';
   let showLabel = store.get('cc.label', 'on') !== 'off';
   let offsetAbs = Number(store.get('cc.north', '0')) || 0; // compass-grade source
   let offsetRel = 0; // relative source: its zero changes every session
@@ -230,7 +250,8 @@
       return;
     }
     if (!finite(event.alpha) || !finite(event.beta) || !finite(event.gamma)) return;
-    const raw = headingFromEuler(event.alpha, event.beta, event.gamma);
+    const alpha = alphaClockwise ? -event.alpha : event.alpha;
+    const raw = headingFromEuler(alpha, event.beta, event.gamma);
     if (raw !== null) pushReading(raw, event.absolute === true);
   }
 
@@ -316,7 +337,7 @@
   function applySettings() {
     app.dataset.style = style;
     app.dataset.label = showLabel ? 'on' : 'off';
-    $('style-btn').textContent = `Style: ${style === 'fill' ? 'Fill' : 'Ring'}`;
+    $('style-btn').textContent = `Style: ${style[0].toUpperCase()}${style.slice(1)}`;
     $('label-btn').textContent = `Heading label: ${showLabel ? 'On' : 'Off'}`;
   }
 
@@ -364,7 +385,7 @@
   $('close-btn').addEventListener('click', closeMenu);
 
   $('style-btn').addEventListener('click', () => {
-    style = style === 'fill' ? 'ring' : 'fill';
+    style = STYLES[(STYLES.indexOf(style) + 1) % STYLES.length];
     store.set('cc.style', style);
     applySettings();
   });
@@ -392,6 +413,17 @@
     offsetAbs = 0;
     offsetRel = 0;
     store.set('cc.north', '0');
+    closeMenu();
+  });
+
+  // Mirrors the compass about north, so a saved north stays where it is.
+  $('flip-btn').addEventListener('click', () => {
+    alphaClockwise = !alphaClockwise;
+    store.set('cc.alpha', alphaClockwise ? 'cw' : 'ccw');
+    offsetAbs = wrap(-offsetAbs);
+    offsetRel = wrap(-offsetRel);
+    store.set('cc.north', String(offsetAbs));
+    vx = -vx;
     closeMenu();
   });
 
