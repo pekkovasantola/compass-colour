@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Shows a colour for the direction you are facing: blue is north, red is south.">
+<meta name="application-name" content="Compass Colour">
+<meta name="mrbd-web-app-capable" content="yes">
+<title>Compass Colour</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<style>
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+
+  html, body, #app { inline-size: 100%; block-size: 100%; }
+
+  body {
+    margin: 0;
+    overflow: hidden;
+    background: #000; /* unlit on the additive display = see-through */
+    color: #fff;
+    font: 500 1.125rem/1.35 system-ui, sans-serif;
+  }
+
+  #app {
+    --c: #2a2a2a; /* current heading colour; grey until the first reading */
+    position: relative;
+    display: grid;
+    place-items: center;
+  }
+
+  /* The colour itself. It is a button so a pinch/tap opens the menu. */
+  #surface {
+    position: absolute;
+    inset: 0;
+    inline-size: 100%;
+    block-size: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    outline: none; /* the only control on screen, so no focus ring over the colour */
+    display: grid;
+    place-items: center;
+    background: var(--c);
+    color: #000; /* black text = see-through cut-out in the colour */
+    font: 700 clamp(2rem, 12vmin, 4.5rem)/1 system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+  }
+
+  #app[data-style="ring"] #surface {
+    background: radial-gradient(circle closest-side,
+      #0000 70%, var(--c) 71.5%, var(--c) 95%, #0000 96.5%);
+    color: var(--c);
+  }
+
+  #app[data-label="off"] #label { visibility: hidden; }
+
+  .panel {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    gap: 0.75rem;
+    inline-size: min(76%, 22rem);
+    padding: 1.25rem;
+    text-align: center;
+    background: #000;
+    border: 2px solid #ffffff40;
+    border-radius: 1.25rem;
+  }
+
+  h1 { margin: 0; font-size: 1.5rem; }
+  p { margin: 0; color: #ddd; }
+
+  .panel button {
+    min-block-size: 3rem;
+    padding: 0.6rem 1rem;
+    font: inherit;
+    color: #fff;
+    background: #1c1c1c;
+    border: 2px solid #ffffff66;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+
+  .panel button:focus-visible {
+    outline: 3px solid #fff;
+    outline-offset: 3px;
+    background: #3a3a3a;
+  }
+</style>
+</head>
+<body>
+<main id="app" data-style="fill" data-label="on">
+
+  <section id="start" class="panel">
+    <h1>Compass Colour</h1>
+    <p>Blue is north, red is south. Uses the motion sensors to read your heading.</p>
+    <button type="button" id="start-btn">Start</button>
+  </section>
+
+  <button type="button" id="surface" aria-label="Open menu" hidden><span id="label"></span></button>
+
+  <section id="menu" class="panel" aria-label="Menu" hidden>
+    <button type="button" id="style-btn"></button>
+    <button type="button" id="label-btn"></button>
+    <button type="button" id="north-btn">Set north to here</button>
+    <button type="button" id="reset-btn">Reset north</button>
+    <button type="button" id="close-btn">Close</button>
+  </section>
+
+  <section id="stale" class="panel" hidden>
+    <p id="stale-msg">No compass data.</p>
+    <button type="button" id="retry-btn">Try again</button>
+    <button type="button" id="demo-btn">Demo sweep</button>
+  </section>
+
+</main>
+
+<script>
+(() => {
+  'use strict';
+
+  const $ = (id) => document.getElementById(id);
+  const app = $('app');
+  const surface = $('surface');
+  const label = $('label');
+  const menu = $('menu');
+
+  const D2R = Math.PI / 180;
+  const SMOOTH_MS = 120;   // low-pass time constant for the heading
+  const STALE_MS = 2500;   // no readings for this long = show the fallback
+  const RENDER_MS = 33;    // repaint at most ~30 times a second
+  const finite = (v) => typeof v === 'number' && Number.isFinite(v);
+  const wrap = (deg) => ((deg % 360) + 360) % 360;
+
+  // ---------------------------------------------------------------- colour
+
+  // Heading (degrees clockwise from north) -> hue on the HSL colour wheel.
+  // Blue (240) and red (0) are not opposite each other on the wheel, so the
+  // two halves of the compass cover unequal arcs of it:
+  //   N -> E -> S : blue -> cyan -> green -> yellow -> red   (240 degrees of hue)
+  //   S -> W -> N : red -> pink -> magenta -> violet -> blue (120 degrees of hue)
+  // Every heading gets its own hue and the wheel closes with no seam.
+  // To put green on the west side instead, mirror the heading: h = 360 - h.
+  function headingToHue(heading) {
+    const h = wrap(heading);
+    return h <= 180
+      ? 240 - (h / 180) * 240
+      : 360 - ((h - 180) / 180) * 120;
+  }
+
+  // ---------------------------------------------------------------- sensor
+
+  // alpha/beta/gamma -> compass heading of the direction the wearer faces.
+  // The docs do not say how the device frame sits on the head, so this takes
+  // the horizontal direction of (device +Y) + (device -Z). That gives the
+  // right answer both when the frame is "flat" (Z up, Y forward) and when it
+  // is "upright" (Y up, -Z forward), across roughly +-45 degrees of head
+  // pitch. Any other mounting shows up as a fixed offset, which "Set north
+  // to here" removes.
+  function headingFromEuler(alpha, beta, gamma) {
+    const a = alpha * D2R, b = beta * D2R, g = gamma * D2R;
+    const cA = Math.cos(a), sA = Math.sin(a);
+    const cB = Math.cos(b), sB = Math.sin(b);
+    const cG = Math.cos(g), sG = Math.sin(g);
+    const east = -cB * sA - cG * sA * sB - cA * sG;
+    const north = cA * cB - sA * sG + cA * cG * sB;
+    if (Math.hypot(east, north) < 0.2) return null; // facing straight up/down
+    return wrap(Math.atan2(east, north) / D2R);
+  }
+
+  // ---------------------------------------------------------------- state
+
+  const store = {
+    get(key, fallback) {
+      try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+    },
+    set(key, value) {
+      try { localStorage.setItem(key, value); } catch { /* storage can fail */ }
+    },
+  };
+
+  let style = store.get('cc.style', 'fill') === 'ring' ? 'ring' : 'fill';
+  let showLabel = store.get('cc.label', 'on') !== 'off';
+  let offsetAbs = Number(store.get('cc.north', '0')) || 0; // compass-grade source
+  let offsetRel = 0; // relative source: its zero changes every session
+
+  let screen = 'start'; // 'start' | 'live' | 'stale'
+  let menuOpen = false;
+  let listening = false;
+  let sim = null; // { fixed: degrees } or { sweep: true }
+
+  let vx = 0, vy = 1;          // smoothed raw heading as a unit-ish vector
+  let haveReading = false;
+  let isAbsolute = false;
+  let lastReadingAt = 0;
+  let lastAbsoluteAt = -Infinity;
+  let shownLabel = null;
+  let lastRenderAt = -Infinity;
+
+  function pushReading(raw, absolute) {
+    const now = performance.now();
+    if (absolute) lastAbsoluteAt = now;
+    else if (now - lastAbsoluteAt < 1000) return; // prefer the absolute source
+
+    const x = Math.sin(raw * D2R), y = Math.cos(raw * D2R);
+    if (!haveReading || absolute !== isAbsolute) {
+      vx = x; vy = y;
+    } else {
+      const k = 1 - Math.exp(-(now - lastReadingAt) / SMOOTH_MS);
+      vx += (x - vx) * k;
+      vy += (y - vy) * k;
+    }
+    haveReading = true;
+    isAbsolute = absolute;
+    lastReadingAt = now;
+    if (screen === 'stale') setScreen('live');
+    render(now);
+  }
+
+  function rawHeading() {
+    return wrap(Math.atan2(vx, vy) / D2R);
+  }
+
+  function onOrientation(event) {
+    if (sim) return;
+    if (finite(event.webkitCompassHeading)) { // iOS Safari, for phone testing
+      pushReading(event.webkitCompassHeading, true);
+      return;
+    }
+    if (!finite(event.alpha) || !finite(event.beta) || !finite(event.gamma)) return;
+    const raw = headingFromEuler(event.alpha, event.beta, event.gamma);
+    if (raw !== null) pushReading(raw, event.absolute === true);
+  }
+
+  function attachSensors() {
+    if (listening) return;
+    if ('ondeviceorientationabsolute' in window) {
+      window.addEventListener('deviceorientationabsolute', onOrientation);
+    }
+    window.addEventListener('deviceorientation', onOrientation);
+    listening = true;
+  }
+
+  async function start() {
+    if (!sim) {
+      const orientation = window.DeviceOrientationEvent;
+      const motion = window.DeviceMotionEvent;
+      if (!orientation) {
+        showStale('This browser has no orientation sensor.');
+        return;
+      }
+      const owner =
+        typeof orientation.requestPermission === 'function' ? orientation
+        : typeof motion?.requestPermission === 'function' ? motion
+        : null;
+      try {
+        const state = owner ? await owner.requestPermission() : 'granted';
+        if (state !== 'granted') {
+          showStale('Sensor access was not granted.');
+          return;
+        }
+      } catch {
+        showStale('Sensor access is unavailable.');
+        return;
+      }
+      attachSensors();
+    }
+    lastReadingAt = performance.now();
+    setScreen('live');
+    keepAwake();
+  }
+
+  async function keepAwake() {
+    try { await navigator.wakeLock?.request('screen'); } catch { /* optional */ }
+  }
+
+  // ---------------------------------------------------------------- screens
+
+  function setScreen(next) {
+    screen = next;
+    $('start').hidden = next !== 'start';
+    $('stale').hidden = next !== 'stale';
+    surface.hidden = next !== 'live';
+    if (next !== 'live') menu.hidden = true;
+    if (next === 'live') (menuOpen ? $('style-btn') : surface).focus();
+    if (next === 'start') $('start-btn').focus();
+    if (next === 'stale') $('retry-btn').focus();
+  }
+
+  function showStale(message) {
+    $('stale-msg').textContent = message;
+    if (menuOpen) history.back();
+    setScreen('stale');
+  }
+
+  function setMenu(open) {
+    menuOpen = open;
+    menu.hidden = !open || screen !== 'live';
+    surface.inert = open;
+    if (screen === 'live') (open ? $('style-btn') : surface).focus();
+  }
+
+  // Back closes the menu: opening it adds one history entry.
+  function openMenu() {
+    if (menuOpen || screen !== 'live') return;
+    history.pushState({ menu: true }, '');
+    setMenu(true);
+  }
+
+  function closeMenu() {
+    if (menuOpen) history.back();
+  }
+
+  function applySettings() {
+    app.dataset.style = style;
+    app.dataset.label = showLabel ? 'on' : 'off';
+    $('style-btn').textContent = `Style: ${style === 'fill' ? 'Fill' : 'Ring'}`;
+    $('label-btn').textContent = `Heading label: ${showLabel ? 'On' : 'Off'}`;
+  }
+
+  // ---------------------------------------------------------------- render
+
+  const POINTS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+
+  // Called from the sensor stream, at most once per RENDER_MS.
+  function render(now) {
+    if (screen !== 'live' || !haveReading || now - lastRenderAt < RENDER_MS) return;
+    lastRenderAt = now;
+    const heading = wrap(rawHeading() + (isAbsolute ? offsetAbs : offsetRel));
+    app.style.setProperty('--c', `hsl(${headingToHue(heading).toFixed(1)} 100% 50%)`);
+    const degrees = Math.round(heading) % 360;
+    const text = `${POINTS[Math.round(heading / 45) % 8]} ${degrees}°${isAbsolute ? '' : ' rel'}`;
+    if (text !== shownLabel) {
+      label.textContent = text;
+      shownLabel = text;
+    }
+  }
+
+  setInterval(() => {
+    if (sim && screen === 'live') {
+      pushReading(sim.sweep ? (performance.now() / 1000) * 30 : sim.fixed, true);
+    }
+  }, RENDER_MS);
+
+  setInterval(() => {
+    if (screen === 'live' && !sim && performance.now() - lastReadingAt > STALE_MS) {
+      haveReading = false;
+      showStale('No compass data.');
+    }
+  }, 500);
+
+  // ---------------------------------------------------------------- wiring
+
+  $('start-btn').addEventListener('click', start);
+  $('retry-btn').addEventListener('click', start);
+  $('demo-btn').addEventListener('click', () => {
+    sim = { sweep: true };
+    start();
+  });
+
+  surface.addEventListener('click', openMenu);
+  $('close-btn').addEventListener('click', closeMenu);
+
+  $('style-btn').addEventListener('click', () => {
+    style = style === 'fill' ? 'ring' : 'fill';
+    store.set('cc.style', style);
+    applySettings();
+  });
+
+  $('label-btn').addEventListener('click', () => {
+    showLabel = !showLabel;
+    store.set('cc.label', showLabel ? 'on' : 'off');
+    applySettings();
+  });
+
+  $('north-btn').addEventListener('click', () => {
+    if (haveReading) {
+      const offset = wrap(-rawHeading());
+      if (isAbsolute) {
+        offsetAbs = offset;
+        store.set('cc.north', String(offset));
+      } else {
+        offsetRel = offset;
+      }
+    }
+    closeMenu();
+  });
+
+  $('reset-btn').addEventListener('click', () => {
+    offsetAbs = 0;
+    offsetRel = 0;
+    store.set('cc.north', '0');
+    closeMenu();
+  });
+
+  window.addEventListener('popstate', (event) => setMenu(event.state?.menu === true));
+
+  // If focus was lost, Enter (pinch) still opens the menu.
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && screen === 'live' && !menuOpen &&
+        document.activeElement === document.body) {
+      openMenu();
+    }
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && screen === 'live') keepAwake();
+  });
+
+  // ?sim sweeps through every heading, ?sim=135 pins one. For desktop preview.
+  const simParam = new URLSearchParams(location.search).get('sim');
+  if (simParam !== null) {
+    sim = simParam !== '' && finite(Number(simParam)) ? { fixed: Number(simParam) } : { sweep: true };
+  }
+
+  history.replaceState({ menu: false }, '');
+  applySettings();
+  setScreen('start');
+})();
+</script>
+</body>
+</html>

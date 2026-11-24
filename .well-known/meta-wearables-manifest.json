@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "name": "Compass Colour",
+  "description": "Shows a colour for the direction you are facing: blue is north, red is south.",
+  "appearance": {
+    "theme_color": "#3867D6",
+    "icon": {
+      "src": "../icon.svg",
+      "type": "monochrome"
+    }
+  }
+}
