@@ -24,12 +24,25 @@
 
   #app {
     --c: #2a2a2a; /* current heading colour; grey until the first reading */
+    --o: 1;       /* opacity of the colour, set by the slider */
+    --dot: 11vmin; /* radius of the corner glow */
+    /* Feathered falloff: full colour only at the very centre, fading to
+       unlit (see-through) at the rim, with no edge anywhere. */
+    --feather:
+      var(--c) 0%,
+      color-mix(in srgb, var(--c) 90%, #000) 15%,
+      color-mix(in srgb, var(--c) 68%, #000) 30%,
+      color-mix(in srgb, var(--c) 44%, #000) 45%,
+      color-mix(in srgb, var(--c) 24%, #000) 60%,
+      color-mix(in srgb, var(--c) 10%, #000) 75%,
+      color-mix(in srgb, var(--c) 3%, #000) 88%,
+      #000 100%;
     position: relative;
     display: grid;
     place-items: center;
   }
 
-  /* The colour itself. It is a button so a pinch/tap opens the menu. */
+  /* The live view. It is a button so a pinch/tap opens the menu. */
   #surface {
     position: absolute;
     inset: 0;
@@ -39,8 +52,33 @@
     padding: 0;
     border: 0;
     outline: none; /* the only control on screen, so no focus ring over the colour */
-    background: var(--c);
+    background: none;
     cursor: pointer;
+  }
+
+  /* The colour itself, on its own layer so opacity does not dim the label. */
+  #surface::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    opacity: var(--o);
+    background: var(--c);
+  }
+
+  #app[data-style="ring"] #surface::before {
+    background: radial-gradient(circle closest-side,
+      #0000 70%, var(--c) 71.5%, var(--c) 95%, #0000 96.5%);
+  }
+
+  #app[data-style="glow"] #surface::before {
+    background: radial-gradient(circle closest-side, var(--feather));
+  }
+
+  /* A small feathered dot tucked into the bottom-right corner. */
+  #app[data-style="corner"] #surface::before {
+    background: radial-gradient(
+      circle var(--dot) at calc(100% - var(--dot)) calc(100% - var(--dot)),
+      var(--feather));
   }
 
   /* Small white readout in the bottom-right corner. The black backing is
@@ -57,23 +95,9 @@
     font-variant-numeric: tabular-nums;
   }
 
-  #app[data-style="ring"] #surface {
-    background: radial-gradient(circle closest-side,
-      #0000 70%, var(--c) 71.5%, var(--c) 95%, #0000 96.5%);
-  }
-
-  /* A soft blob with no edge anywhere: full colour only at the very centre,
-     fading to unlit (see-through) by the edge of the display. */
-  #app[data-style="glow"] #surface {
-    background: radial-gradient(circle closest-side,
-      var(--c) 0%,
-      color-mix(in srgb, var(--c) 90%, #000) 15%,
-      color-mix(in srgb, var(--c) 68%, #000) 30%,
-      color-mix(in srgb, var(--c) 44%, #000) 45%,
-      color-mix(in srgb, var(--c) 24%, #000) 60%,
-      color-mix(in srgb, var(--c) 10%, #000) 75%,
-      color-mix(in srgb, var(--c) 3%, #000) 88%,
-      #000 100%);
+  /* The corner glow takes the corner, so the readout sits just left of it. */
+  #app[data-style="corner"] #label {
+    inset-inline-end: calc(2 * var(--dot));
   }
 
   #app[data-label="off"] #label, #label:empty { display: none; }
@@ -89,6 +113,8 @@
     background: #000;
     border: 2px solid #ffffff40;
     border-radius: 1.25rem;
+    max-block-size: calc(100% - 1.5rem);
+    overflow-y: auto;
   }
 
   h1 { margin: 0; font-size: 1.5rem; }
@@ -110,6 +136,22 @@
     outline-offset: 3px;
     background: #3a3a3a;
   }
+
+  .slider { display: grid; gap: 0.25rem; }
+
+  .slider input {
+    inline-size: 100%;
+    block-size: 2rem;
+    margin: 0;
+    accent-color: #fff;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+
+  .slider input:focus-visible {
+    outline: 3px solid #fff;
+    outline-offset: 3px;
+  }
 </style>
 </head>
 <body>
@@ -125,6 +167,10 @@
 
   <section id="menu" class="panel" aria-label="Menu" hidden>
     <button type="button" id="style-btn"></button>
+    <div class="slider">
+      <label for="opacity">Opacity <output id="opacity-out" for="opacity"></output></label>
+      <input type="range" id="opacity" min="10" max="100" step="10" value="100">
+    </div>
     <button type="button" id="label-btn"></button>
     <button type="button" id="north-btn">Set north to here</button>
     <button type="button" id="reset-btn">Reset north</button>
@@ -204,13 +250,16 @@
     },
   };
 
-  const STYLES = ['fill', 'ring', 'glow'];
+  const STYLES = ['glow', 'corner', 'fill', 'ring'];
   let style = STYLES.includes(store.get('cc.style', 'glow')) ? store.get('cc.style', 'glow') : 'glow';
   // Which way alpha counts. The W3C spec says counter-clockwise, but on the
   // glasses the heading ran backwards with that, so clockwise is the default.
   // "Reverse direction" in the menu switches it.
   let alphaClockwise = store.get('cc.alpha', 'cw') !== 'ccw';
   let showLabel = store.get('cc.label', 'on') !== 'off';
+  const opacityInput = $('opacity');
+  const clampOpacity = (v) => Math.min(100, Math.max(10, Math.round(v / 10) * 10));
+  let opacity = clampOpacity(Number(store.get('cc.opacity', '100')) || 100);
   let offsetAbs = Number(store.get('cc.north', '0')) || 0; // compass-grade source
   let offsetRel = 0; // relative source: its zero changes every session
 
@@ -347,6 +396,9 @@
     app.dataset.label = showLabel ? 'on' : 'off';
     $('style-btn').textContent = `Style: ${style[0].toUpperCase()}${style.slice(1)}`;
     $('label-btn').textContent = `Heading label: ${showLabel ? 'On' : 'Off'}`;
+    app.style.setProperty('--o', String(opacity / 100));
+    opacityInput.value = String(opacity);
+    $('opacity-out').textContent = `${opacity}%`;
   }
 
   // ---------------------------------------------------------------- render
@@ -396,6 +448,29 @@
     style = STYLES[(STYLES.indexOf(style) + 1) % STYLES.length];
     store.set('cc.style', style);
     applySettings();
+  });
+
+  function setOpacity(value) {
+    opacity = clampOpacity(value);
+    store.set('cc.opacity', String(opacity));
+    applySettings();
+  }
+
+  opacityInput.addEventListener('input', () => setOpacity(Number(opacityInput.value)));
+
+  // The glasses send arrow keys. On the slider, left/right change the value
+  // and up/down move to the neighbouring menu item, so focus is never trapped.
+  opacityInput.addEventListener('keydown', (event) => {
+    const step = { ArrowLeft: -10, ArrowRight: 10 }[event.key];
+    const move = { ArrowUp: -1, ArrowDown: 1 }[event.key];
+    if (step) {
+      event.preventDefault();
+      setOpacity(opacity + step);
+    } else if (move) {
+      event.preventDefault();
+      const items = [...menu.querySelectorAll('button, input')];
+      items[items.indexOf(opacityInput) + move]?.focus();
+    }
   });
 
   $('label-btn').addEventListener('click', () => {
