@@ -39,19 +39,27 @@
     padding: 0;
     border: 0;
     outline: none; /* the only control on screen, so no focus ring over the colour */
-    display: grid;
-    place-items: center;
     background: var(--c);
-    color: #000; /* black text = see-through cut-out in the colour */
-    font: 700 clamp(2rem, 12vmin, 4.5rem)/1 system-ui, sans-serif;
-    font-variant-numeric: tabular-nums;
     cursor: pointer;
+  }
+
+  /* Small white readout in the bottom-right corner. The black backing is
+     unlit, so it only shows as a notch when the colour fills the display. */
+  #label {
+    position: absolute;
+    inset-inline-end: 0.375rem;
+    inset-block-end: 0.375rem;
+    padding: 0.2rem 0.5rem;
+    border-radius: 0.5rem;
+    background: #000;
+    color: #fff;
+    font: 600 1.125rem/1.2 system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
   }
 
   #app[data-style="ring"] #surface {
     background: radial-gradient(circle closest-side,
       #0000 70%, var(--c) 71.5%, var(--c) 95%, #0000 96.5%);
-    color: var(--c);
   }
 
   /* A soft blob with no edge anywhere: full colour only at the very centre,
@@ -68,7 +76,7 @@
       #000 100%);
   }
 
-  #app[data-label="off"] #label { visibility: hidden; }
+  #app[data-label="off"] #label, #label:empty { display: none; }
 
   .panel {
     position: relative;
@@ -105,7 +113,7 @@
 </style>
 </head>
 <body>
-<main id="app" data-style="fill" data-label="on">
+<main id="app" data-style="glow" data-label="on">
 
   <section id="start" class="panel">
     <h1>Compass Colour</h1>
@@ -197,7 +205,7 @@
   };
 
   const STYLES = ['fill', 'ring', 'glow'];
-  let style = STYLES.includes(store.get('cc.style', 'fill')) ? store.get('cc.style', 'fill') : 'fill';
+  let style = STYLES.includes(store.get('cc.style', 'glow')) ? store.get('cc.style', 'glow') : 'glow';
   // Which way alpha counts. The W3C spec says counter-clockwise, but on the
   // glasses the heading ran backwards with that, so clockwise is the default.
   // "Reverse direction" in the menu switches it.
