@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Shows a colour for the direction you are facing: blue is north, red is south.">
+<meta name="description" content="Shows a colour for the direction you are facing: blue is north, orange is south.">
 <meta name="application-name" content="Compass Colour">
 <meta name="mrbd-web-app-capable" content="yes">
 <title>Compass Colour</title>
@@ -24,7 +24,7 @@
 
   #app {
     --c: #2a2a2a; /* current heading colour; grey until the first reading */
-    --o: 1;       /* opacity of the colour, set by the slider */
+    --o: 1;       /* opacity of the colour, set from the menu */
     --dot: 11vmin; /* radius of the corner glow */
     /* Feathered falloff: full colour only at the very centre, fading to
        unlit (see-through) at the rim, with no edge anywhere. */
@@ -137,21 +137,15 @@
     background: #3a3a3a;
   }
 
-  .slider { display: grid; gap: 0.25rem; }
-
-  .slider input {
-    inline-size: 100%;
-    block-size: 2rem;
-    margin: 0;
-    accent-color: #fff;
-    border-radius: 999px;
-    cursor: pointer;
+  .stepper {
+    display: grid;
+    grid-template-columns: 4rem minmax(0, 1fr) 4rem;
+    align-items: center;
+    gap: 0.5rem;
   }
 
-  .slider input:focus-visible {
-    outline: 3px solid #fff;
-    outline-offset: 3px;
-  }
+  .stepper button { padding-inline: 0; font-size: 1.5rem; line-height: 1; }
+  .stepper button[aria-disabled="true"] { opacity: 0.4; }
 </style>
 </head>
 <body>
@@ -159,7 +153,7 @@
 
   <section id="start" class="panel">
     <h1>Compass Colour</h1>
-    <p>Blue is north, red is south. Uses the motion sensors to read your heading.</p>
+    <p>Blue is north, orange is south. Uses the motion sensors to read your heading.</p>
     <button type="button" id="start-btn">Start</button>
   </section>
 
@@ -167,9 +161,10 @@
 
   <section id="menu" class="panel" aria-label="Menu" hidden>
     <button type="button" id="style-btn"></button>
-    <div class="slider">
-      <label for="opacity">Opacity <output id="opacity-out" for="opacity"></output></label>
-      <input type="range" id="opacity" min="10" max="100" step="10" value="100">
+    <div class="stepper" role="group" aria-label="Opacity">
+      <button type="button" id="opacity-down" aria-label="Decrease opacity">&minus;</button>
+      <output id="opacity-out"></output>
+      <button type="button" id="opacity-up" aria-label="Increase opacity">+</button>
     </div>
     <button type="button" id="label-btn"></button>
     <button type="button" id="north-btn">Set north to here</button>
@@ -206,17 +201,15 @@
   // ---------------------------------------------------------------- colour
 
   // Heading (degrees clockwise from north) -> hue on the HSL colour wheel.
-  // Blue (240) and red (0) are not opposite each other on the wheel, so the
-  // two halves of the compass cover unequal arcs of it:
-  //   N -> E -> S : blue -> cyan -> green -> yellow -> red   (240 degrees of hue)
-  //   S -> W -> N : red -> pink -> magenta -> violet -> blue (120 degrees of hue)
-  // Every heading gets its own hue and the wheel closes with no seam.
-  // To put green on the west side instead, mirror the heading: h = 360 - h.
+  // One degree of heading is one degree of hue, so the wheel is spread evenly
+  // and opposite headings get opposite (complementary) colours:
+  //   N azure blue (210), E green (120), S orange (30), W magenta (300).
+  // Change NORTH_HUE to rotate the whole wheel; use "+ wrap(heading)" to put
+  // green on the west side instead.
+  const NORTH_HUE = 210;
+
   function headingToHue(heading) {
-    const h = wrap(heading);
-    return h <= 180
-      ? 240 - (h / 180) * 240
-      : 360 - ((h - 180) / 180) * 120;
+    return wrap(NORTH_HUE - wrap(heading));
   }
 
   // ---------------------------------------------------------------- sensor
@@ -257,7 +250,6 @@
   // "Reverse direction" in the menu switches it.
   let alphaClockwise = store.get('cc.alpha', 'cw') !== 'ccw';
   let showLabel = store.get('cc.label', 'on') !== 'off';
-  const opacityInput = $('opacity');
   const clampOpacity = (v) => Math.min(100, Math.max(10, Math.round(v / 10) * 10));
   let opacity = clampOpacity(Number(store.get('cc.opacity', '100')) || 100);
   let offsetAbs = Number(store.get('cc.north', '0')) || 0; // compass-grade source
@@ -397,8 +389,10 @@
     $('style-btn').textContent = `Style: ${style[0].toUpperCase()}${style.slice(1)}`;
     $('label-btn').textContent = `Heading label: ${showLabel ? 'On' : 'Off'}`;
     app.style.setProperty('--o', String(opacity / 100));
-    opacityInput.value = String(opacity);
-    $('opacity-out').textContent = `${opacity}%`;
+    $('opacity-out').textContent = `Opacity ${opacity}%`;
+    // At a limit the button stays focusable (so focus is not lost) but dims.
+    $('opacity-down').setAttribute('aria-disabled', String(opacity <= 10));
+    $('opacity-up').setAttribute('aria-disabled', String(opacity >= 100));
   }
 
   // ---------------------------------------------------------------- render
@@ -456,22 +450,8 @@
     applySettings();
   }
 
-  opacityInput.addEventListener('input', () => setOpacity(Number(opacityInput.value)));
-
-  // The glasses send arrow keys. On the slider, left/right change the value
-  // and up/down move to the neighbouring menu item, so focus is never trapped.
-  opacityInput.addEventListener('keydown', (event) => {
-    const step = { ArrowLeft: -10, ArrowRight: 10 }[event.key];
-    const move = { ArrowUp: -1, ArrowDown: 1 }[event.key];
-    if (step) {
-      event.preventDefault();
-      setOpacity(opacity + step);
-    } else if (move) {
-      event.preventDefault();
-      const items = [...menu.querySelectorAll('button, input')];
-      items[items.indexOf(opacityInput) + move]?.focus();
-    }
-  });
+  $('opacity-down').addEventListener('click', () => setOpacity(opacity - 10));
+  $('opacity-up').addEventListener('click', () => setOpacity(opacity + 10));
 
   $('label-btn').addEventListener('click', () => {
     showLabel = !showLabel;
