@@ -146,6 +146,26 @@
 
   .stepper button { padding-inline: 0; font-size: 1.5rem; line-height: 1; }
   .stepper button[aria-disabled="true"] { opacity: 0.4; }
+
+  #menu { gap: 0.5rem; padding: 1rem; }
+
+  /* Live sensor readout, for working out how the glasses report heading. */
+  #diag {
+    inline-size: min(96%, 36rem);
+    gap: 0.5rem;
+    padding: 0.75rem;
+    text-align: start;
+  }
+
+  #diag-out {
+    margin: 0;
+    overflow: hidden;
+    white-space: pre;
+    color: #fff;
+    font: 500 1.0625rem/1.35 ui-monospace, Menlo, Consolas, monospace;
+  }
+
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
 </style>
 </head>
 <body>
@@ -170,7 +190,17 @@
     <button type="button" id="north-btn">Set north to here</button>
     <button type="button" id="reset-btn">Reset north</button>
     <button type="button" id="flip-btn">Reverse direction</button>
+    <button type="button" id="diag-btn">Diagnostics</button>
     <button type="button" id="close-btn">Close</button>
+  </section>
+
+  <section id="diag" class="panel" aria-label="Diagnostics" hidden>
+    <pre id="diag-out"></pre>
+    <div class="pair">
+      <button type="button" id="src-btn"></button>
+      <button type="button" id="gyro-btn"></button>
+    </div>
+    <button type="button" id="diag-close">Close</button>
   </section>
 
   <section id="stale" class="panel" hidden>
@@ -215,21 +245,32 @@
   // ---------------------------------------------------------------- sensor
 
   // alpha/beta/gamma -> compass heading of the direction the wearer faces.
-  // The docs do not say how the device frame sits on the head, so this takes
-  // the horizontal direction of (device +Y) + (device -Z). That gives the
-  // right answer both when the frame is "flat" (Z up, Y forward) and when it
-  // is "upright" (Y up, -Z forward), across roughly +-45 degrees of head
-  // pitch. Any other mounting shows up as a fixed offset, which "Set north
-  // to here" removes.
-  function headingFromEuler(alpha, beta, gamma) {
+  // The angles are read as the W3C Z-X'-Y'' rotation of the device. The docs
+  // do not say which device axis points forward on the head, so the heading
+  // is taken from a blend of the two usual candidates: +Y (frame lies flat,
+  // Z up) and -Z (frame stands upright, Y up). wY and wZ are the weights. An
+  // axis that points up or down must get no weight, or tilting the head
+  // sideways swings the heading. Any other mounting shows up as a fixed
+  // offset, which "Set north to here" removes.
+  function headingFromEuler(alpha, beta, gamma, wY, wZ) {
     const a = alpha * D2R, b = beta * D2R, g = gamma * D2R;
     const cA = Math.cos(a), sA = Math.sin(a);
     const cB = Math.cos(b), sB = Math.sin(b);
     const cG = Math.cos(g), sG = Math.sin(g);
-    const east = -cB * sA - cG * sA * sB - cA * sG;
-    const north = cA * cB - sA * sG + cA * cG * sB;
+    const east = wY * (-cB * sA) + wZ * (-cG * sA * sB - cA * sG);
+    const north = wY * (cA * cB) + wZ * (-sA * sG + cA * cG * sB);
     if (Math.hypot(east, north) < 0.2) return null; // facing straight up/down
     return wrap(Math.atan2(east, north) / D2R);
+  }
+
+  // Heading of a Generic Sensor orientation quaternion [x, y, z, w], for the
+  // same two forward-axis candidates. Diagnostics only.
+  function headingsFromQuaternion([x, y, z, w]) {
+    const deg = (east, north) => wrap(Math.atan2(east, north) / D2R);
+    return {
+      flat: deg(2 * (x * y - w * z), 1 - 2 * (x * x + z * z)),
+      upright: deg(-2 * (x * z + w * y), -2 * (y * z - w * x)),
+    };
   }
 
   // ---------------------------------------------------------------- state
@@ -255,8 +296,16 @@
   let offsetAbs = Number(store.get('cc.north', '0')) || 0; // compass-grade source
   let offsetRel = 0; // relative source: its zero changes every session
 
+  // Where the heading comes from: 'auto' picks the forward axis from the
+  // usual head posture, 'alpha' trusts alpha alone, 'upright' forces -Z.
+  const SOURCES = ['auto', 'alpha', 'upright'];
+  const SOURCE_NAMES = { auto: 'Auto', alpha: 'Alpha only', upright: 'Upright' };
+  let source = SOURCES.includes(store.get('cc.src', 'auto')) ? store.get('cc.src', 'auto') : 'auto';
+  let useGyro = store.get('cc.gyro', 'on') !== 'off';
+
   let screen = 'start'; // 'start' | 'live' | 'stale'
   let menuOpen = false;
+  let diagOpen = false;
   let listening = false;
   let sim = null; // { fixed: degrees } or { sweep: true }
 
@@ -292,16 +341,194 @@
     return wrap(Math.atan2(vx, vy) / D2R);
   }
 
+  // ---- motion: gravity and gyro
+
+  const wrap180 = (deg) => wrap(deg + 180) - 180;
+  const GYRO_FRESH_MS = 300; // gyro data older than this is not used
+  const TURN_RATE = 8;       // deg/s about the vertical that counts as turning
+  const GYRO_LEARN = 40;     // turning to see before the gyro is trusted
+  const GYRO_CAP = 4000;     // cap on the learning sums, so they can re-learn
+
+  let up = null;         // "up" in the device frame, from the accelerometer
+  let upHabit = null;    // the same averaged over ~20 s: the usual head posture
+  let lastMotionAt = 0;
+  let lastGyroAt = -Infinity;
+  let gyroTurn = 0;      // degrees turned about the vertical since the last reading
+  let yawRate = 0;       // deg/s about the vertical, sign as the sensor reports it
+  let lastGrav = null, lastRate = null; // raw values, for diagnostics
+  let oriEvents = 0, motEvents = 0;
+
+  function blendUnit(current, target, k) {
+    if (!current) return target.slice();
+    const v = current.map((c, i) => c + (target[i] - c) * k);
+    const len = Math.hypot(v[0], v[1], v[2]);
+    return len > 1e-6 ? v.map((c) => c / len) : target.slice();
+  }
+
+  function onMotion(event) {
+    if (sim) return;
+    motEvents += 1;
+    const now = performance.now();
+    const dt = Math.min((now - lastMotionAt) / 1000, 0.1);
+    lastMotionAt = now;
+
+    const g = event.accelerationIncludingGravity;
+    if (g && finite(g.x) && finite(g.y) && finite(g.z)) {
+      lastGrav = { x: g.x, y: g.y, z: g.z };
+      const size = Math.hypot(g.x, g.y, g.z);
+      if (size > 1) {
+        const n = [g.x / size, g.y / size, g.z / size];
+        // Far from 1 g means the head is accelerating, not just tilted.
+        const steady = Math.abs(size - 9.81) < 2 ? 1 : 0.1;
+        up = blendUnit(up, n, (1 - Math.exp(-dt / 0.3)) * steady);
+        upHabit = blendUnit(upHabit, n, 1 - Math.exp(-dt / 20));
+      }
+    }
+
+    const r = event.rotationRate;
+    if (r && finite(r.alpha) && finite(r.beta) && finite(r.gamma)) {
+      lastRate = { alpha: r.alpha, beta: r.beta, gamma: r.gamma };
+      if (up) {
+        // Turning rate about the vertical: tilting the head adds nothing to
+        // it, whichever way the device frame sits on the head.
+        // rotationRate.beta/gamma/alpha are about the device x/y/z axes.
+        yawRate = r.beta * up[0] + r.gamma * up[1] + r.alpha * up[2];
+        gyroTurn += yawRate * dt;
+        lastGyroAt = now;
+      }
+    }
+  }
+
+  function tiltFromHabit() {
+    if (!up || !upHabit) return 0;
+    const dot = up[0] * upHabit[0] + up[1] * upHabit[1] + up[2] * upHabit[2];
+    return Math.acos(Math.min(1, Math.max(-1, dot))) / D2R;
+  }
+
+  // ---- usual posture, from the orientation angles themselves
+
+  const POSE_S = 10;
+  let poseY = null, poseZ = null; // averaged "up" along device Y and Z
+  let lastPoseAt = 0;
+
+  function updatePose(beta, gamma, now) {
+    const uy = Math.sin(beta * D2R);
+    const uz = Math.cos(beta * D2R) * Math.cos(gamma * D2R);
+    const dt = (now - lastPoseAt) / 1000;
+    lastPoseAt = now;
+    if (poseY === null || dt > 5) {
+      poseY = uy; poseZ = uz;
+    } else {
+      const k = 1 - Math.exp(-dt / POSE_S);
+      poseY += (uy - poseY) * k;
+      poseZ += (uz - poseZ) * k;
+    }
+  }
+
+  // The more an axis points up or down in the usual posture, the less it can
+  // be the forward axis. The 4th power makes the choice close to all-or-none.
+  function autoWeights() {
+    const wY = (1 - poseY * poseY) ** 4;
+    const wZ = (1 - poseZ * poseZ) ** 4;
+    return [wY / (wY + wZ), wZ / (wY + wZ)];
+  }
+
+  // alpha here already counts counter-clockwise, as in the W3C spec.
+  function referenceHeading(src, alpha, beta, gamma) {
+    if (src === 'alpha') return wrap(-alpha);
+    if (src === 'upright') return headingFromEuler(alpha, beta, gamma, 0, 1);
+    const [wY, wZ] = autoWeights();
+    return headingFromEuler(alpha, beta, gamma, wY, wZ);
+  }
+
+  // ---- fusion: the gyro carries the heading from moment to moment, and the
+  // orientation heading (the reference) pulls it back slowly so it cannot
+  // drift. While the head is tilted away from its usual posture the pull is
+  // weaker, because that is when the reference is least reliable.
+
+  let fused = null;
+  let fusedAbsolute = null;
+  let lastRef = null, lastRefAt = 0;
+  let sxx = 0, sxy = 0; // gyro turn against reference change, while turning
+  let disagree = 0;     // smoothed |reference - fused|, in degrees
+  let trust = 1;        // 1 = head in its usual posture, 0 = well tilted
+
+  const gyroGain = () => (sxx > 0 ? sxy / sxx : 0);
+
+  // The gyro is used once it has been seen to track the reference one-to-one
+  // (in either direction: the sign is learned too).
+  function gyroReady() {
+    const gain = Math.abs(gyroGain());
+    return sxx >= GYRO_LEARN && gain > 0.5 && gain < 2;
+  }
+
+  function resetFusion() {
+    fused = null;
+    lastRef = null;
+    gyroTurn = 0;
+  }
+
+  function fuse(ref, now) {
+    const dt = (now - lastRefAt) / 1000;
+    const turn = gyroTurn;
+    gyroTurn = 0;
+    const usable = fused !== null && dt < 0.5 && now - lastGyroAt < GYRO_FRESH_MS;
+    const change = lastRef === null ? 0 : wrap180(ref - lastRef);
+    lastRef = ref;
+    lastRefAt = now;
+    if (!usable) {
+      fused = ref;
+      return ref;
+    }
+
+    if (Math.abs(turn) > TURN_RATE * dt) {
+      sxx += turn * turn;
+      sxy += turn * change;
+      if (sxx > GYRO_CAP) {
+        sxy *= GYRO_CAP / sxx;
+        sxx = GYRO_CAP;
+      }
+    }
+    if (!gyroReady()) {
+      fused = ref;
+      return ref;
+    }
+
+    const tilt = tiltFromHabit();
+    const t = Math.min(1, Math.max(0, (tilt - 8) / 14));
+    trust = 1 - t * t * (3 - 2 * t);
+    const pullSeconds = 1.5 + (1 - trust) * 12;
+
+    fused += Math.sign(sxy) * turn;
+    const error = wrap180(ref - fused);
+    fused = wrap(fused + error * (1 - Math.exp(-dt / pullSeconds)));
+    disagree += (Math.abs(error) - disagree) * (1 - Math.exp(-dt / 2));
+    return useGyro ? fused : ref;
+  }
+
+  let lastOri = null; // last accepted angles, for diagnostics
+
   function onOrientation(event) {
     if (sim) return;
+    oriEvents += 1;
     if (finite(event.webkitCompassHeading)) { // iOS Safari, for phone testing
       pushReading(event.webkitCompassHeading, true);
       return;
     }
     if (!finite(event.alpha) || !finite(event.beta) || !finite(event.gamma)) return;
+    const now = performance.now();
+    const absolute = event.absolute === true;
+    if (!absolute && now - lastAbsoluteAt < 1000) return; // prefer the absolute source
+    lastOri = { alpha: event.alpha, beta: event.beta, gamma: event.gamma, absolute };
     const alpha = alphaClockwise ? -event.alpha : event.alpha;
-    const raw = headingFromEuler(alpha, event.beta, event.gamma);
-    if (raw !== null) pushReading(raw, event.absolute === true);
+    updatePose(event.beta, event.gamma, now);
+    const ref = referenceHeading(source, alpha, event.beta, event.gamma);
+    if (ref === null) return;
+    if (absolute !== fusedAbsolute) {
+      resetFusion();
+      fusedAbsolute = absolute;
+    }
+    pushReading(fuse(ref, now), absolute);
   }
 
   function attachSensors() {
@@ -310,6 +537,7 @@
       window.addEventListener('deviceorientationabsolute', onOrientation);
     }
     window.addEventListener('deviceorientation', onOrientation);
+    window.addEventListener('devicemotion', onMotion);
     listening = true;
   }
 
@@ -353,7 +581,10 @@
     $('start').hidden = next !== 'start';
     $('stale').hidden = next !== 'stale';
     surface.hidden = next !== 'live';
-    if (next !== 'live') menu.hidden = true;
+    if (next !== 'live') {
+      menu.hidden = true;
+      $('diag').hidden = true;
+    }
     if (next === 'live') (menuOpen ? $('style-btn') : surface).focus();
     if (next === 'start') $('start-btn').focus();
     if (next === 'stale') $('retry-btn').focus();
@@ -365,11 +596,16 @@
     setScreen('stale');
   }
 
-  function setMenu(open) {
+  // The diagnostics readout takes the menu's place, so Back closes it too.
+  function setMenu(open, diag = false) {
+    const live = screen === 'live';
     menuOpen = open;
-    menu.hidden = !open || screen !== 'live';
+    diagOpen = open && diag && live;
+    menu.hidden = !open || diagOpen || !live;
+    $('diag').hidden = !diagOpen;
     surface.inert = open;
-    if (screen === 'live') (open ? $('style-btn') : surface).focus();
+    setDiagRunning(diagOpen);
+    if (live) (diagOpen ? $('diag-close') : open ? $('style-btn') : surface).focus();
   }
 
   // Back closes the menu: opening it adds one history entry.
@@ -393,6 +629,121 @@
     // At a limit the button stays focusable (so focus is not lost) but dims.
     $('opacity-down').setAttribute('aria-disabled', String(opacity <= 10));
     $('opacity-up').setAttribute('aria-disabled', String(opacity >= 100));
+    $('src-btn').textContent = `Source: ${SOURCE_NAMES[source]}`;
+    $('gyro-btn').textContent = `Gyro: ${useGyro ? 'On' : 'Off'}`;
+  }
+
+  // ---------------------------------------------------------------- diagnostics
+
+  // Sensors beyond the two events the docs list. They are only probed while
+  // the readout is open, to see whether the glasses have them at all.
+  const extra = { aos: null, mag: null, aosText: 'no', magText: 'no' };
+
+  function probeSensor(name, options, onReading, setText) {
+    if (!(name in window)) {
+      setText('no');
+      return null;
+    }
+    try {
+      const sensor = new window[name](options);
+      sensor.onreading = () => onReading(sensor);
+      sensor.onerror = (event) => setText((event.error?.name ?? 'error').replace(/Error$/, ''));
+      sensor.start();
+      setText('wait');
+      return sensor;
+    } catch (error) {
+      setText((error.name ?? 'error').replace(/Error$/, ''));
+      return null;
+    }
+  }
+
+  function startExtraSensors() {
+    extra.aos = probeSensor('AbsoluteOrientationSensor', { frequency: 10 }, (sensor) => {
+      const h = headingsFromQuaternion(sensor.quaternion);
+      extra.aosText = `${Math.round(h.flat)}/${Math.round(h.upright)}`;
+    }, (text) => { extra.aosText = text; });
+    extra.mag = probeSensor('Magnetometer', { frequency: 10 }, (sensor) => {
+      extra.magText = `${Math.round(Math.hypot(sensor.x, sensor.y, sensor.z))}uT`;
+    }, (text) => { extra.magText = text; });
+  }
+
+  function stopExtraSensors() {
+    for (const key of ['aos', 'mag']) {
+      try { extra[key]?.stop(); } catch { /* already stopped */ }
+      extra[key] = null;
+    }
+  }
+
+  let diagTimer = null;
+  let rateAt = 0, oriHz = NaN, motHz = NaN;
+
+  function setDiagRunning(on) {
+    if (on === (diagTimer !== null)) return;
+    if (on) {
+      rateAt = performance.now();
+      oriEvents = 0;
+      motEvents = 0;
+      oriHz = NaN;
+      motHz = NaN;
+      startExtraSensors();
+      updateDiag();
+      diagTimer = setInterval(updateDiag, 250);
+    } else {
+      clearInterval(diagTimer);
+      diagTimer = null;
+      stopExtraSensors();
+    }
+  }
+
+  function updateDiag() {
+    const now = performance.now();
+    if (now - rateAt >= 1000) {
+      oriHz = (oriEvents * 1000) / (now - rateAt);
+      motHz = (motEvents * 1000) / (now - rateAt);
+      oriEvents = 0;
+      motEvents = 0;
+      rateAt = now;
+    }
+    const n1 = (v) => (finite(v) ? v.toFixed(1) : '--');
+    const n0 = (v) => (finite(v) && v !== null ? String(Math.round(v)) : '--');
+    const o = lastOri, g = lastGrav, r = lastRate;
+
+    // Which device axis points up, and whether the orientation angles agree
+    // with the accelerometer about where "up" is (0 = the angles follow the
+    // W3C convention; "inv" = gravity is reported with the opposite sign).
+    let upAxis = '--', match = '--';
+    if (up) {
+      const i = [0, 1, 2].reduce((best, k) => (Math.abs(up[k]) > Math.abs(up[best]) ? k : best), 0);
+      upAxis = `${up[i] < 0 ? '-' : '+'}${'XYZ'[i]}`;
+      if (o) {
+        const b = o.beta * D2R, c = o.gamma * D2R;
+        const dot = -Math.cos(b) * Math.sin(c) * up[0] + Math.sin(b) * up[1] +
+          Math.cos(b) * Math.cos(c) * up[2];
+        match = `${Math.round(Math.acos(Math.min(1, Math.abs(dot))) / D2R)}${dot < 0 ? ' inv' : ''}`;
+      }
+    }
+
+    // What each heading source says right now, before the gyro and "Set north".
+    const head = { alpha: null, upright: null, auto: null };
+    if (o) {
+      const alpha = alphaClockwise ? -o.alpha : o.alpha;
+      for (const key of SOURCES) head[key] = referenceHeading(key, alpha, o.beta, o.gamma);
+    }
+
+    const out = haveReading ? rawHeading() : null;
+    const gain = sxx > 0 ? gyroGain().toFixed(2) : '--';
+    const state = gyroReady() ? 'ready' : 'learning';
+    $('diag-out').textContent = [
+      `ORI  a ${n1(o?.alpha)}  b ${n1(o?.beta)}  g ${n1(o?.gamma)}`,
+      `     ${o ? (o.absolute ? 'absolute' : 'relative') : 'no data'}  ${n0(oriHz)} Hz  alpha ${alphaClockwise ? 'cw' : 'ccw'}`,
+      `GRAV x ${n1(g?.x)}  y ${n1(g?.y)}  z ${n1(g?.z)}  up ${upAxis}`,
+      `GYRO x ${n1(r?.beta)}  y ${n1(r?.gamma)}  z ${n1(r?.alpha)}  ${n0(motHz)} Hz`,
+      `TILT angles-vs-gravity ${match}  off-usual ${n0(tiltFromHabit())}`,
+      `HEAD alpha ${n0(head.alpha)}  upright ${n0(head.upright)}  auto ${n0(head.auto)}`,
+      `TURN gain ${gain} ${state}  ${n0(yawRate)} deg/s`,
+      `OUT  ${n0(out)}  ref-gyro ${n1(disagree)}  trust ${Math.round(trust * 100)}%`,
+      `API  AOS ${extra.aosText}  MAG ${extra.magText}  GEO ${'geolocation' in navigator ? 'yes' : 'no'}`,
+    ].join('\n');
   }
 
   // ---------------------------------------------------------------- render
@@ -420,7 +771,7 @@
   }, RENDER_MS);
 
   setInterval(() => {
-    if (screen === 'live' && !sim && performance.now() - lastReadingAt > STALE_MS) {
+    if (screen === 'live' && !sim && !diagOpen && performance.now() - lastReadingAt > STALE_MS) {
       haveReading = false;
       showStale('No compass data.');
     }
@@ -487,7 +838,25 @@
     offsetRel = wrap(-offsetRel);
     store.set('cc.north', String(offsetAbs));
     vx = -vx;
+    sxy = -sxy; // the gyro now runs the other way relative to the heading
+    resetFusion();
     closeMenu();
+  });
+
+  $('diag-btn').addEventListener('click', () => setMenu(true, true));
+  $('diag-close').addEventListener('click', closeMenu);
+
+  $('src-btn').addEventListener('click', () => {
+    source = SOURCES[(SOURCES.indexOf(source) + 1) % SOURCES.length];
+    store.set('cc.src', source);
+    resetFusion();
+    applySettings();
+  });
+
+  $('gyro-btn').addEventListener('click', () => {
+    useGyro = !useGyro;
+    store.set('cc.gyro', useGyro ? 'on' : 'off');
+    applySettings();
   });
 
   window.addEventListener('popstate', (event) => setMenu(event.state?.menu === true));
